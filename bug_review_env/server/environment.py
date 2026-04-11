@@ -28,8 +28,19 @@ from bug_review_env.models import BugReviewAction, BugReviewObservation, BugRevi
 
 def _clamp(score: float) -> float:
     """Ensure score is strictly inside (0, 1) — never exactly 0.0 or 1.0."""
-    return round(max(0.01, min(0.99, score)), 2)
+    score = float(score)
 
+    # Handle invalid numeric values
+    if score != score:  # NaN check
+        return 0.5
+
+    if score <= 0.0:
+        return 0.01
+
+    if score >= 1.0:
+        return 0.99
+
+    return score
 
 # ---------------------------------------------------------------------------
 # Task definitions
