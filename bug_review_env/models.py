@@ -58,4 +58,4 @@ class BugReviewState(BaseModel):
     step_count: int = 0
     task_name: str = ""
     attempts: int = 0
-    last_score: float = 0.0
+    last_score: float = 0.01
