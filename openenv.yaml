@@ -21,16 +21,19 @@ tasks:
     description: Identify an off-by-one error in a list indexing function
     difficulty: easy
     max_steps: 3
+    score_range: [0.01, 0.99]
 
   - name: find_bug_medium
     description: Identify SQL injection or hardcoded secret in authentication code
     difficulty: medium
     max_steps: 3
+    score_range: [0.01, 0.99]
 
   - name: find_bug_hard
     description: Identify a race condition in multi-threaded banking code
     difficulty: hard
     max_steps: 3
+    score_range: [0.01, 0.99]
 
 action_space:
   type: object
