@@ -1,18 +1,22 @@
 """
-Bug Review Environment — core logic.
+Bug Review Environment — core logic (multi-step version).
 
 Three tasks of increasing difficulty:
   easy   → obvious off-by-one error
-  medium → hardcoded secret / SQL injection
-  hard   → subtle race condition
+  medium → SQL injection / hardcoded secret
+  hard   → race condition
 
-Each task has a deterministic grader that scores 0.0–1.0.
-Partial credit is awarded for getting the line right, bug type right,
-or explanation that contains key terms — even if not all three.
+Multi-step episodes:
+  - Agent gets up to MAX_ATTEMPTS tries per task
+  - After each attempt, detailed feedback is returned
+  - Reward increases as agent gets closer to correct answer
+  - Final reward = best score achieved across all attempts
+  - Partial credit awarded per component (line, type, explanation)
+  - Penalty for repeated identical wrong answers
 """
 
 import uuid
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 
 from bug_review_env.models import BugReviewAction, BugReviewObservation, BugReviewState
 
@@ -36,14 +40,18 @@ def compute_average(numbers):
 """,
         "instructions": (
             "The function `get_last_element` contains a classic indexing bug. "
-            "Identify the line number where the bug occurs, classify the bug type, "
-            "and explain how to fix it."
+            "Identify the line number where the bug occurs, classify the bug type "
+            "(off_by_one | null_dereference | sql_injection | hardcoded_secret | "
+            "race_condition | logic_error | insecure_deserialization | other), "
+            "and explain how to fix it. You have up to 3 attempts — use the "
+            "feedback from each attempt to improve your answer."
         ),
         "answer": {
             "buggy_line": 3,
             "bug_type": "off_by_one",
             "key_terms": ["len(items) - 1", "len(items)-1", "-1", "index out", "off by one", "off-by-one"],
         },
+        "max_attempts": 3,
     },
 
     "find_bug_medium": {
@@ -68,11 +76,12 @@ def login(username, password):
         "instructions": (
             "This code contains TWO security vulnerabilities. "
             "Identify the most critical one: its line number, bug type, and explanation. "
-            "Bug types to consider: sql_injection, hardcoded_secret, logic_error."
+            "Bug types: sql_injection | hardcoded_secret | logic_error. "
+            "You have up to 3 attempts — use the feedback to refine your answer."
         ),
         "answer": {
-            "buggy_line": 6,           # primary: SQL injection
-            "alt_buggy_line": 11,      # secondary: hardcoded secret — also accepted
+            "buggy_line": 6,
+            "alt_buggy_line": 11,
             "bug_type": "sql_injection",
             "alt_bug_type": "hardcoded_secret",
             "key_terms": [
@@ -80,6 +89,7 @@ def login(username, password):
                 "placeholder", "? ", "hardcoded", "hard-coded", "secret", "password"
             ],
         },
+        "max_attempts": 3,
     },
 
     "find_bug_hard": {
@@ -106,9 +116,9 @@ def run_concurrent_withdrawals():
 """,
         "instructions": (
             "This multi-threaded banking code has a subtle concurrency bug. "
-            "Identify the line number where the bug manifests, classify the bug type "
-            "as race_condition, and explain why two concurrent withdrawals of 600 "
-            "can each succeed even when the balance is only 1000."
+            "Identify the line number, classify as race_condition, and explain "
+            "why two concurrent withdrawals of 600 can each succeed when balance "
+            "is only 1000. You have up to 3 attempts — use feedback to improve."
         ),
         "answer": {
             "buggy_line": 7,
@@ -120,128 +130,69 @@ def run_concurrent_withdrawals():
                 "time of check", "non-atomic"
             ],
         },
+        "max_attempts": 3,
     },
 }
 
 TASK_ORDER = ["find_bug_easy", "find_bug_medium", "find_bug_hard"]
+MAX_ATTEMPTS = 3
 
 # ---------------------------------------------------------------------------
-# Grader functions
+# Grader functions — return (score, feedback, component_scores)
 # ---------------------------------------------------------------------------
 
-def _grade_easy(action: BugReviewAction) -> Tuple[float, str]:
-    answer = TASKS["find_bug_easy"]["answer"]
+def _grade(action: BugReviewAction, answer: dict, weights: dict) -> Tuple[float, str, dict]:
     score = 0.0
     parts = []
+    components = {"line": False, "type": False, "explanation": False}
 
-    # Line number: 0.4 points
-    if action.buggy_line == answer["buggy_line"]:
-        score += 0.4
-        parts.append("✓ Correct line number (+0.40)")
-    else:
-        parts.append(f"✗ Wrong line. Expected {answer['buggy_line']}, got {action.buggy_line} (+0.00)")
-
-    # Bug type: 0.3 points
-    if action.bug_type == answer["bug_type"]:
-        score += 0.3
-        parts.append("✓ Correct bug type (+0.30)")
-    else:
-        parts.append(f"✗ Wrong bug type. Expected '{answer['bug_type']}', got '{action.bug_type}' (+0.00)")
-
-    # Explanation key terms: 0.3 points
-    expl_lower = action.explanation.lower()
-    if any(term in expl_lower for term in answer["key_terms"]):
-        score += 0.3
-        parts.append("✓ Explanation contains correct fix (+0.30)")
-    else:
-        parts.append("✗ Explanation missing key fix details (+0.00)")
-
-    feedback = " | ".join(parts) + f" → Total: {score:.2f}"
-    return round(score, 2), feedback
-
-
-def _grade_medium(action: BugReviewAction) -> Tuple[float, str]:
-    answer = TASKS["find_bug_medium"]["answer"]
-    score = 0.0
-    parts = []
-
-    # Line: either primary (6) or secondary (11) accepted
-    correct_line = (
-        action.buggy_line == answer["buggy_line"] or
-        action.buggy_line == answer["alt_buggy_line"]
-    )
+    # Line number
+    correct_line = action.buggy_line == answer.get("buggy_line")
+    if not correct_line and "alt_buggy_line" in answer:
+        correct_line = action.buggy_line == answer["alt_buggy_line"]
     if correct_line:
-        score += 0.35
-        parts.append(f"✓ Correct line number (+0.35)")
+        score += weights["line"]
+        components["line"] = True
+        parts.append(f"✓ Correct line number (+{weights['line']:.2f})")
     else:
-        parts.append(f"✗ Wrong line. Expected {answer['buggy_line']} or {answer['alt_buggy_line']} (+0.00)")
+        expected = answer.get("buggy_line")
+        alt = answer.get("alt_buggy_line", "")
+        hint = f"Hint: look between lines 1-10." if expected <= 10 else "Hint: look carefully at the logic flow."
+        parts.append(f"✗ Wrong line. {hint} (+0.00)")
 
-    # Bug type: either sql_injection or hardcoded_secret accepted
-    correct_type = (
-        action.bug_type == answer["bug_type"] or
-        action.bug_type == answer["alt_bug_type"]
-    )
+    # Bug type
+    correct_type = action.bug_type == answer.get("bug_type")
+    if not correct_type and "alt_bug_type" in answer:
+        correct_type = action.bug_type == answer["alt_bug_type"]
     if correct_type:
-        score += 0.35
-        parts.append("✓ Correct bug type (+0.35)")
+        score += weights["type"]
+        components["type"] = True
+        parts.append(f"✓ Correct bug type (+{weights['type']:.2f})")
     else:
-        parts.append(f"✗ Wrong bug type (+0.00)")
+        valid_types = "off_by_one|null_dereference|sql_injection|hardcoded_secret|race_condition|logic_error|insecure_deserialization|other"
+        parts.append(f"✗ Wrong bug type '{action.bug_type}'. Consider: {valid_types} (+0.00)")
 
     # Explanation key terms
     expl_lower = action.explanation.lower()
-    if any(term in expl_lower for term in answer["key_terms"]):
-        score += 0.30
-        parts.append("✓ Explanation identifies the vulnerability (+0.30)")
-    else:
-        parts.append("✗ Explanation missing key security terms (+0.00)")
-
-    feedback = " | ".join(parts) + f" → Total: {score:.2f}"
-    return round(score, 2), feedback
-
-
-def _grade_hard(action: BugReviewAction) -> Tuple[float, str]:
-    answer = TASKS["find_bug_hard"]["answer"]
-    score = 0.0
-    parts = []
-
-    # Line: line 7 or 8 both valid
-    correct_line = (
-        action.buggy_line == answer["buggy_line"] or
-        action.buggy_line == answer["alt_buggy_line"]
-    )
-    if correct_line:
-        score += 0.30
-        parts.append("✓ Correct line number (+0.30)")
-    else:
-        parts.append(f"✗ Wrong line. Expected 7 or 8 (+0.00)")
-
-    # Bug type: must be race_condition
-    if action.bug_type == answer["bug_type"]:
-        score += 0.30
-        parts.append("✓ Correct bug type: race_condition (+0.30)")
-    else:
-        parts.append(f"✗ Wrong bug type. Expected 'race_condition', got '{action.bug_type}' (+0.00)")
-
-    # Explanation: must mention concurrency/threading concepts
-    expl_lower = action.explanation.lower()
-    matching = [term for term in answer["key_terms"] if term in expl_lower]
+    matching = [t for t in answer.get("key_terms", []) if t in expl_lower]
     if len(matching) >= 2:
-        score += 0.40
-        parts.append("✓ Explanation demonstrates deep understanding (+0.40)")
+        score += weights["expl_full"]
+        components["explanation"] = True
+        parts.append(f"✓ Explanation demonstrates understanding (+{weights['expl_full']:.2f})")
     elif len(matching) == 1:
-        score += 0.20
-        parts.append("✓ Explanation partially correct (+0.20)")
+        score += weights["expl_partial"]
+        parts.append(f"~ Explanation partially correct — be more specific (+{weights['expl_partial']:.2f})")
     else:
-        parts.append("✗ Explanation missing concurrency concepts (+0.00)")
+        parts.append("✗ Explanation missing key concepts — think about the root cause (+0.00)")
 
-    feedback = " | ".join(parts) + f" → Total: {score:.2f}"
-    return round(score, 2), feedback
+    feedback = " | ".join(parts) + f" → Score: {score:.2f}"
+    return round(score, 2), feedback, components
 
 
-GRADERS = {
-    "find_bug_easy": _grade_easy,
-    "find_bug_medium": _grade_medium,
-    "find_bug_hard": _grade_hard,
+GRADER_WEIGHTS = {
+    "find_bug_easy":   {"line": 0.40, "type": 0.30, "expl_full": 0.30, "expl_partial": 0.15},
+    "find_bug_medium": {"line": 0.35, "type": 0.35, "expl_full": 0.30, "expl_partial": 0.15},
+    "find_bug_hard":   {"line": 0.30, "type": 0.30, "expl_full": 0.40, "expl_partial": 0.20},
 }
 
 # ---------------------------------------------------------------------------
@@ -250,17 +201,25 @@ GRADERS = {
 
 class BugReviewEnvironment:
     """
-    OpenEnv-compatible environment for code bug review tasks.
+    Multi-step OpenEnv-compatible environment for code bug review.
 
-    Episodes run one task at a time. The agent submits a BugReviewAction
-    (line number + bug type + explanation). The grader scores it 0.0–1.0.
-    The episode ends after the first action (done=True), giving a single
-    clean reward signal. Callers may loop over all three tasks manually.
+    Episodes allow up to MAX_ATTEMPTS actions per task.
+    After each attempt, detailed feedback guides the agent.
+    The episode ends when:
+      - Agent achieves perfect score (1.0)
+      - Agent exhausts all attempts
+    Final reward = best score achieved across all attempts.
+    Repeated identical wrong answers incur a small penalty.
     """
 
     def __init__(self):
         self._state = BugReviewState()
         self._current_task: str = TASK_ORDER[0]
+        self._best_score: float = 0.0
+        self._attempts: int = 0
+        self._max_attempts: int = MAX_ATTEMPTS
+        self._last_action: dict = {}
+        self._all_rewards: List[float] = []
 
     def reset(self, task_name: str = "find_bug_easy") -> BugReviewObservation:
         """Start a new episode for the given task."""
@@ -268,6 +227,12 @@ class BugReviewEnvironment:
             task_name = TASK_ORDER[0]
 
         self._current_task = task_name
+        self._best_score = 0.0
+        self._attempts = 0
+        self._max_attempts = TASKS[task_name]["max_attempts"]
+        self._last_action = {}
+        self._all_rewards = []
+
         self._state = BugReviewState(
             episode_id=str(uuid.uuid4()),
             step_count=0,
@@ -288,26 +253,71 @@ class BugReviewEnvironment:
     def step(self, action: BugReviewAction) -> Tuple[BugReviewObservation, float, bool]:
         """
         Execute one step: grade the action, return (observation, reward, done).
-        The episode always ends after one action (done=True).
+
+        Reward shaping:
+          - Full credit for each correct component
+          - Partial credit for partial explanation
+          - Small penalty (-0.05) for repeating exact same wrong answer
+          - Episode ends when perfect score OR attempts exhausted
         """
         self._state.step_count += 1
-        self._state.attempts += 1
+        self._attempts += 1
+        self._state.attempts = self._attempts
 
         task = TASKS[self._current_task]
-        grader = GRADERS[self._current_task]
-        score, feedback = grader(action)
+        answer = task["answer"]
+        weights = GRADER_WEIGHTS[self._current_task]
+
+        score, feedback, components = _grade(action, answer, weights)
+
+        # Penalty for repeating identical wrong answer
+        current_action = {
+            "buggy_line": action.buggy_line,
+            "bug_type": action.bug_type,
+        }
+        if self._last_action == current_action and score < 1.0:
+            score = max(0.0, score - 0.05)
+            feedback += " | ⚠ Penalty: repeated same answer (-0.05)"
+
+        self._last_action = current_action
+        self._all_rewards.append(score)
+
+        # Update best score
+        if score > self._best_score:
+            self._best_score = score
 
         self._state.last_score = score
+
+        # Determine if episode is done
+        attempts_left = self._max_attempts - self._attempts
+        perfect = score >= 1.0
+        exhausted = attempts_left <= 0
+        done = perfect or exhausted
+
+        # Build feedback message
+        if not done:
+            feedback += f" | Attempts remaining: {attempts_left}"
+        elif perfect:
+            feedback += " | 🎉 Perfect score! Well done."
+        else:
+            feedback += f" | Episode complete. Best score: {self._best_score:.2f}"
 
         obs = BugReviewObservation(
             code_snippet=task["code_snippet"],
             task_name=task["display_name"],
             instructions=task["instructions"],
             feedback=feedback,
-            done=True,
+            done=done,
         )
-        return obs, score, True   # done=True after first action
+
+        # Return best score as final reward on last step
+        reward = self._best_score if done else score
+        return obs, reward, done
 
     @property
     def state(self) -> BugReviewState:
         return self._state
+
+    @property
+    def all_rewards(self) -> List[float]:
+        return self._all_rewards
