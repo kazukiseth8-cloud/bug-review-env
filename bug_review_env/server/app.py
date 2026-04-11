@@ -2,22 +2,26 @@
 FastAPI server for the Bug Review Environment.
 Exposes /reset, /step, /state endpoints per OpenEnv spec.
 """
-
 import os
 import uuid
 from typing import Any, Dict, Optional
-
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-
 from bug_review_env.server.environment import BugReviewEnvironment, TASK_ORDER
 from bug_review_env.models import BugReviewAction, BugReviewObservation, BugReviewState
 
 # ---------------------------------------------------------------------------
-# App setup
+# Score clamping — all scores must be STRICTLY between 0 and 1
 # ---------------------------------------------------------------------------
 
+def _clamp(score: float) -> float:
+    """Ensure score is strictly inside (0, 1) — never exactly 0.0 or 1.0."""
+    return round(max(0.01, min(0.99, float(score))), 2)
+
+# ---------------------------------------------------------------------------
+# App setup
+# ---------------------------------------------------------------------------
 app = FastAPI(
     title="Bug Review Environment",
     description=(
@@ -34,7 +38,6 @@ _session_id: str = str(uuid.uuid4())
 # ---------------------------------------------------------------------------
 # Request / Response schemas (OpenEnv spec)
 # ---------------------------------------------------------------------------
-
 class ResetRequest(BaseModel):
     task_name: Optional[str] = "find_bug_easy"
 
@@ -57,7 +60,6 @@ class StateResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
-
 @app.get("/")
 def root():
     return {
@@ -68,11 +70,9 @@ def root():
         "endpoints": ["/reset", "/step", "/state", "/health"],
     }
 
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
 
 @app.post("/reset")
 def reset(request: ResetRequest = ResetRequest()):
@@ -82,8 +82,12 @@ def reset(request: ResetRequest = ResetRequest()):
     """
     task_name = request.task_name or "find_bug_easy"
     obs = _env.reset(task_name=task_name)
-    return obs.model_dump()
-
+    result = obs.model_dump()
+    # Clamp any float fields in the observation
+    for key, val in result.items():
+        if isinstance(val, float):
+            result[key] = _clamp(val)
+    return result
 
 @app.post("/step")
 def step(request: StepRequest):
@@ -97,13 +101,22 @@ def step(request: StepRequest):
         raise HTTPException(status_code=422, detail=f"Invalid action format: {e}")
 
     obs, reward, done = _env.step(action)
+
+    # Final safety clamp — reward must be strictly between 0 and 1
+    reward = _clamp(reward)
+
+    # Also clamp any floats inside the observation dict
+    obs_dict = obs.model_dump()
+    for key, val in obs_dict.items():
+        if isinstance(val, float):
+            obs_dict[key] = _clamp(val)
+
     return StepResult(
-        observation=obs.model_dump(),
+        observation=obs_dict,
         reward=reward,
         done=done,
         info={"task": _env.state.task_name},
     ).model_dump()
-
 
 @app.get("/state")
 def state():
@@ -114,9 +127,8 @@ def state():
         step_count=s.step_count,
         task_name=s.task_name,
         attempts=s.attempts,
-        last_score=s.last_score,
+        last_score=_clamp(s.last_score),
     ).model_dump()
-
 
 @app.get("/tasks")
 def list_tasks():
