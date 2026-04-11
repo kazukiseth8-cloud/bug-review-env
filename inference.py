@@ -2,6 +2,7 @@
 inference.py — Bug Review Environment Baseline Agent
 =====================================================
 Strictly follows Meta x Scaler OpenEnv Hackathon guidelines.
+Supports multi-step episodes (up to 3 attempts per task).
 
 Environment variables:
     API_BASE_URL   API endpoint for the LLM (default provided)
@@ -17,14 +18,13 @@ STDOUT FORMAT (mandatory):
 import asyncio
 import json
 import os
-import sys
 import textwrap
 from typing import List, Optional
 
 from openai import OpenAI
 
 # ---------------------------------------------------------------------------
-# Configuration — read from environment variables
+# Configuration
 # ---------------------------------------------------------------------------
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
@@ -35,8 +35,8 @@ ENV_URL      = os.getenv("BUG_REVIEW_ENV_URL", "http://localhost:7860")
 if HF_TOKEN is None:
     raise ValueError("HF_TOKEN environment variable is required")
 
-BENCHMARK  = "bug-review-env"
-MAX_STEPS  = 1
+BENCHMARK   = "bug-review-env"
+MAX_STEPS   = 3        # multi-step: up to 3 attempts per task
 TEMPERATURE = 0.2
 MAX_TOKENS  = 400
 SUCCESS_SCORE_THRESHOLD = 0.5
@@ -44,7 +44,7 @@ SUCCESS_SCORE_THRESHOLD = 0.5
 TASKS = ["find_bug_easy", "find_bug_medium", "find_bug_hard"]
 
 # ---------------------------------------------------------------------------
-# Logging helpers — MANDATORY FORMAT (do not modify)
+# Logging helpers — MANDATORY FORMAT
 # ---------------------------------------------------------------------------
 
 def log_start(task: str, env: str, model: str) -> None:
@@ -52,8 +52,8 @@ def log_start(task: str, env: str, model: str) -> None:
 
 
 def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
-    error_val = error if error else "null"
-    done_val  = str(done).lower()
+    error_val   = error if error else "null"
+    done_val    = str(done).lower()
     action_clean = action.replace(" ", "_").replace("\n", "").replace("\r", "")[:80]
     print(
         f"[STEP] step={step} action={action_clean} reward={reward:.2f} "
@@ -70,7 +70,7 @@ def log_end(success: bool, steps: int, rewards: List[float]) -> None:
     )
 
 # ---------------------------------------------------------------------------
-# System prompt for the LLM agent
+# System prompt
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = textwrap.dedent("""
@@ -83,6 +83,8 @@ SYSTEM_PROMPT = textwrap.dedent("""
            race_condition | logic_error | insecure_deserialization | other
       3. A clear explanation of the bug and how to fix it
 
+    If you receive feedback from a previous attempt, use it to improve your answer.
+
     You MUST respond with ONLY a valid JSON object, no other text:
     {
       "buggy_line": <integer>,
@@ -92,22 +94,25 @@ SYSTEM_PROMPT = textwrap.dedent("""
 """).strip()
 
 
-def build_user_prompt(code_snippet: str, instructions: str) -> str:
-    return (
+def build_user_prompt(code_snippet: str, instructions: str, feedback: str = "") -> str:
+    prompt = (
         f"INSTRUCTIONS:\n{instructions}\n\n"
         f"CODE SNIPPET (lines numbered from 1):\n"
-        f"```python\n{code_snippet}\n```\n\n"
-        f"Respond with ONLY a JSON object with keys: buggy_line, bug_type, explanation."
+        f"```python\n{code_snippet}\n```\n"
     )
+    if feedback:
+        prompt += f"\nFEEDBACK FROM PREVIOUS ATTEMPT:\n{feedback}\n"
+    prompt += "\nRespond with ONLY a JSON object with keys: buggy_line, bug_type, explanation."
+    return prompt
 
 # ---------------------------------------------------------------------------
-# LLM call using OpenAI client (mandatory per guidelines)
+# LLM call
 # ---------------------------------------------------------------------------
 
-def get_agent_action(client: OpenAI, code_snippet: str, instructions: str) -> dict:
+def get_agent_action(client: OpenAI, code_snippet: str, instructions: str, feedback: str = "") -> dict:
     """Call the LLM and parse JSON action. Returns safe default on failure."""
     try:
-        user_prompt = build_user_prompt(code_snippet, instructions)
+        user_prompt = build_user_prompt(code_snippet, instructions, feedback)
         completion = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
@@ -148,7 +153,7 @@ def get_agent_action(client: OpenAI, code_snippet: str, instructions: str) -> di
         return {"buggy_line": 0, "bug_type": "other", "explanation": "llm_error"}
 
 # ---------------------------------------------------------------------------
-# Environment calls using httpx (for env server communication only)
+# Environment calls
 # ---------------------------------------------------------------------------
 
 async def env_reset(task_name: str) -> dict:
@@ -175,15 +180,16 @@ async def env_step(action: dict) -> dict:
         return resp.json()
 
 # ---------------------------------------------------------------------------
-# Run one task episode
+# Run one task episode (multi-step)
 # ---------------------------------------------------------------------------
 
 async def run_task(client: OpenAI, task_name: str) -> None:
-    """Run a single task episode and emit START / STEP / END logs."""
+    """Run a multi-step task episode and emit START / STEP / END logs."""
     rewards: List[float] = []
     steps_taken = 0
     success     = False
     error_msg: Optional[str] = None
+    feedback    = ""
 
     log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
@@ -198,13 +204,15 @@ async def run_task(client: OpenAI, task_name: str) -> None:
             if done:
                 break
 
-            # Get action from LLM using OpenAI client
-            action_dict = get_agent_action(client, code_snippet, instructions)
+            # Get action from LLM — pass feedback from previous step
+            action_dict = get_agent_action(client, code_snippet, instructions, feedback)
 
             # Step through environment
-            result = await env_step(action_dict)
-            reward = float(result.get("reward", 0.0))
-            done   = bool(result.get("done", True))
+            result   = await env_step(action_dict)
+            reward   = float(result.get("reward", 0.0))
+            done     = bool(result.get("done", True))
+            obs      = result.get("observation", {})
+            feedback = obs.get("feedback", "")
 
             rewards.append(reward)
             steps_taken = step
@@ -226,8 +234,8 @@ async def run_task(client: OpenAI, task_name: str) -> None:
             if done:
                 break
 
-        score   = rewards[-1] if rewards else 0.0
-        success = score >= SUCCESS_SCORE_THRESHOLD
+        final_score = max(rewards) if rewards else 0.0
+        success     = final_score >= SUCCESS_SCORE_THRESHOLD
 
     except Exception as exc:
         error_msg = str(exc)[:100]
@@ -245,7 +253,6 @@ async def run_task(client: OpenAI, task_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    # Initialize OpenAI client (mandatory per guidelines)
     client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
     for task in TASKS:
