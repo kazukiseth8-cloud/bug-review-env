@@ -27,7 +27,7 @@ def _clamp(score: float) -> float:
         return 0.05
     if s >= 1.0:
         return 0.95
-    return round(s, 4)
+    return s
 
 # ---------------------------------------------------------------------------
 # Task definitions
