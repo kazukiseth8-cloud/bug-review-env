@@ -1,6 +1,9 @@
 """
 Bug Review Environment — core logic.
 Scores are STRICTLY between 0 and 1 (exclusive) — never 0.0, never 1.0.
+
+Grader weights are designed so max raw score = 0.94 (never reaches 1.0).
+_clamp() ensures minimum score = 0.05 (never reaches 0.0).
 """
 
 import uuid
@@ -9,7 +12,7 @@ from typing import Dict, Tuple, List
 from bug_review_env.models import BugReviewAction, BugReviewObservation, BugReviewState
 
 # ---------------------------------------------------------------------------
-# Score clamping — strictly (0, 1) exclusive, never 0.0 or 1.0
+# Score clamping — strictly (0, 1) exclusive
 # ---------------------------------------------------------------------------
 
 def _clamp(score: float) -> float:
@@ -28,6 +31,7 @@ def _clamp(score: float) -> float:
 
 # ---------------------------------------------------------------------------
 # Task definitions
+# Weights per task sum to 0.94 max — never reaches 1.0
 # ---------------------------------------------------------------------------
 
 TASKS: Dict[str, Dict] = {
@@ -54,10 +58,19 @@ def compute_average(numbers):
         "answer": {
             "buggy_line": 3,
             "bug_type": "off_by_one",
-            "key_terms": ["len(items) - 1", "len(items)-1", "-1", "index out", "off by one", "off-by-one"],
+            "key_terms": [
+                "len(items) - 1", "len(items)-1", "-1",
+                "index out", "off by one", "off-by-one"
+            ],
         },
         "max_attempts": 3,
-        "weights": {"line": 0.38, "type": 0.28, "expl_full": 0.28, "expl_partial": 0.14},
+        # line + type + expl_full = 0.38 + 0.28 + 0.28 = 0.94 max
+        "weights": {
+            "line": 0.38,
+            "type": 0.28,
+            "expl_full": 0.28,
+            "expl_partial": 0.14,
+        },
     },
 
     "find_bug_medium": {
@@ -96,7 +109,13 @@ def login(username, password):
             ],
         },
         "max_attempts": 3,
-        "weights": {"line": 0.33, "type": 0.33, "expl_full": 0.28, "expl_partial": 0.14},
+        # line + type + expl_full = 0.33 + 0.33 + 0.28 = 0.94 max
+        "weights": {
+            "line": 0.33,
+            "type": 0.33,
+            "expl_full": 0.28,
+            "expl_partial": 0.14,
+        },
     },
 
     "find_bug_hard": {
@@ -138,7 +157,13 @@ def run_concurrent_withdrawals():
             ],
         },
         "max_attempts": 3,
-        "weights": {"line": 0.28, "type": 0.28, "expl_full": 0.38, "expl_partial": 0.19},
+        # line + type + expl_full = 0.28 + 0.28 + 0.38 = 0.94 max
+        "weights": {
+            "line": 0.28,
+            "type": 0.28,
+            "expl_full": 0.38,
+            "expl_partial": 0.19,
+        },
     },
 }
 
@@ -149,7 +174,10 @@ TASK_ORDER = ["find_bug_easy", "find_bug_medium", "find_bug_hard"]
 # ---------------------------------------------------------------------------
 
 def _grade(action: BugReviewAction, answer: dict, weights: dict) -> Tuple[float, str]:
-    """Grade an action. Returns score strictly in (0, 1)."""
+    """
+    Grade an action. Returns score strictly in (0, 1).
+    Max raw = 0.94, min raw = 0.0 → clamped to 0.05.
+    """
     raw_score = 0.0
     parts = []
 
@@ -174,7 +202,7 @@ def _grade(action: BugReviewAction, answer: dict, weights: dict) -> Tuple[float,
     else:
         parts.append(f"✗ Wrong bug type '{action.bug_type}' (+0.00)")
 
-    # Explanation
+    # Explanation key terms
     expl_lower = action.explanation.lower()
     matching = [t for t in answer.get("key_terms", []) if t in expl_lower]
     if len(matching) >= 2:
@@ -184,9 +212,9 @@ def _grade(action: BugReviewAction, answer: dict, weights: dict) -> Tuple[float,
         raw_score += weights["expl_partial"]
         parts.append(f"~ Partial explanation (+{weights['expl_partial']:.2f})")
     else:
-        parts.append("✗ Explanation needs improvement (+0.00)")
+        parts.append("✗ Explanation needs more detail (+0.00)")
 
-    # ALWAYS clamp to strictly (0, 1)
+    # Always clamp — converts 0.0 → 0.05, max 0.94 stays below 0.95
     score = _clamp(raw_score)
     feedback = " | ".join(parts) + f" → Score: {score:.4f}"
     return score, feedback
@@ -196,7 +224,10 @@ def _grade(action: BugReviewAction, answer: dict, weights: dict) -> Tuple[float,
 # ---------------------------------------------------------------------------
 
 class BugReviewEnvironment:
-    """Multi-step OpenEnv environment. Scores always strictly in (0, 1)."""
+    """
+    Multi-step OpenEnv environment for code bug review.
+    All scores strictly in (0, 1) — never 0.0, never 1.0.
+    """
 
     def __init__(self):
         self._state = BugReviewState()
@@ -207,6 +238,7 @@ class BugReviewEnvironment:
         self._last_action: dict = {}
 
     def reset(self, task_name: str = "find_bug_easy") -> BugReviewObservation:
+        """Start a new episode. Returns initial observation."""
         if task_name not in TASKS:
             task_name = TASK_ORDER[0]
 
@@ -221,7 +253,7 @@ class BugReviewEnvironment:
             step_count=0,
             task_name=task_name,
             attempts=0,
-            last_score=_clamp(0.05),
+            last_score=0.05,
         )
 
         task = TASKS[task_name]
@@ -234,6 +266,10 @@ class BugReviewEnvironment:
         )
 
     def step(self, action: BugReviewAction) -> Tuple[BugReviewObservation, float, bool]:
+        """
+        Grade the action and return (observation, reward, done).
+        reward is always strictly in (0, 1).
+        """
         self._state.step_count += 1
         self._attempts += 1
         self._state.attempts = self._attempts
@@ -244,18 +280,23 @@ class BugReviewEnvironment:
 
         score, feedback = _grade(action, answer, weights)
 
-        # Penalty for repeating same wrong answer
-        current_action = {"buggy_line": action.buggy_line, "bug_type": action.bug_type}
+        # Small penalty for repeating exact same wrong answer
+        current_action = {
+            "buggy_line": action.buggy_line,
+            "bug_type": action.bug_type,
+        }
         if self._last_action == current_action and score < 0.90:
             score = _clamp(score - 0.04)
             feedback += " | ⚠ Penalty: repeated same answer"
         self._last_action = current_action
 
+        # Track best score
         if score > self._best_score:
             self._best_score = score
+        self._best_score = _clamp(self._best_score)
+        self._state.last_score = score
 
-        self._state.last_score = _clamp(score)
-
+        # Episode ends when near-perfect OR attempts exhausted
         attempts_left = self._max_attempts - self._attempts
         done = (score >= 0.90) or (attempts_left <= 0)
 
@@ -264,9 +305,9 @@ class BugReviewEnvironment:
         elif score >= 0.90:
             feedback += " | 🎉 Excellent work!"
         else:
-            feedback += f" | Episode complete. Best score: {self._best_score:.4f}"
+            feedback += f" | Episode complete. Best: {self._best_score:.4f}"
 
-        # Final reward is always best score, always clamped
+        # Reward: best score on final step, current otherwise — always clamped
         reward = _clamp(self._best_score) if done else _clamp(score)
 
         obs = BugReviewObservation(
