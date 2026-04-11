@@ -71,11 +71,10 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
 
 
 def log_end(success: bool, steps: int, rewards: List[float]) -> None:
-    # Always clamp all rewards before logging
     safe_rewards = [_clamp(r) for r in rewards] if rewards else [0.05]
-    rewards_str  = ",".join(f"{r:.4f}" for r in safe_rewards)
+    final_score  = _clamp(max(safe_rewards))
     print(
-        f"[END] success={str(success).lower()} steps={steps} rewards={rewards_str}",
+        f"[END] success={str(success).lower()} steps={steps} score={final_score:.4f}",
         flush=True,
     )
 
