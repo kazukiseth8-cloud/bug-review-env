@@ -270,6 +270,12 @@ class BugReviewEnvironment:
         Grade the action and return (observation, reward, done).
         reward is always strictly in (0, 1).
         """
+        # Safety: if no task loaded, return safe defaults
+        if self._current_task not in TASKS:
+            return BugReviewObservation(
+                code_snippet="", task_name="", instructions="",
+                feedback="No active task", done=True
+            ), 0.05, True
         self._state.step_count += 1
         self._attempts += 1
         self._state.attempts = self._attempts
