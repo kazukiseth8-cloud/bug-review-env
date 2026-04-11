@@ -13,12 +13,23 @@ Multi-step episodes:
   - Final reward = best score achieved across all attempts
   - Partial credit awarded per component (line, type, explanation)
   - Penalty for repeated identical wrong answers
+
+All scores are strictly between 0 and 1 (never exactly 0.0 or 1.0).
 """
 
 import uuid
 from typing import Dict, Tuple, List
 
 from bug_review_env.models import BugReviewAction, BugReviewObservation, BugReviewState
+
+# ---------------------------------------------------------------------------
+# Score clamping — scores must be STRICTLY between 0 and 1
+# ---------------------------------------------------------------------------
+
+def _clamp(score: float) -> float:
+    """Ensure score is strictly inside (0, 1) — never exactly 0.0 or 1.0."""
+    return round(max(0.01, min(0.99, score)), 2)
+
 
 # ---------------------------------------------------------------------------
 # Task definitions
@@ -156,8 +167,7 @@ def _grade(action: BugReviewAction, answer: dict, weights: dict) -> Tuple[float,
         parts.append(f"✓ Correct line number (+{weights['line']:.2f})")
     else:
         expected = answer.get("buggy_line")
-        alt = answer.get("alt_buggy_line", "")
-        hint = f"Hint: look between lines 1-10." if expected <= 10 else "Hint: look carefully at the logic flow."
+        hint = "Hint: look between lines 1-10." if expected <= 10 else "Hint: look carefully at the logic flow."
         parts.append(f"✗ Wrong line. {hint} (+0.00)")
 
     # Bug type
@@ -185,14 +195,17 @@ def _grade(action: BugReviewAction, answer: dict, weights: dict) -> Tuple[float,
     else:
         parts.append("✗ Explanation missing key concepts — think about the root cause (+0.00)")
 
+    # Clamp so intermediate scores are always safe
+    score = _clamp(score)
     feedback = " | ".join(parts) + f" → Score: {score:.2f}"
-    return round(score, 2), feedback, components
+    return score, feedback, components
 
 
+# Key change: weights now sum to 0.99 max so perfect score = 0.99 (never 1.0)
 GRADER_WEIGHTS = {
-    "find_bug_easy":   {"line": 0.40, "type": 0.30, "expl_full": 0.30, "expl_partial": 0.15},
-    "find_bug_medium": {"line": 0.35, "type": 0.35, "expl_full": 0.30, "expl_partial": 0.15},
-    "find_bug_hard":   {"line": 0.30, "type": 0.30, "expl_full": 0.40, "expl_partial": 0.20},
+    "find_bug_easy":   {"line": 0.40, "type": 0.30, "expl_full": 0.29, "expl_partial": 0.14},
+    "find_bug_medium": {"line": 0.35, "type": 0.35, "expl_full": 0.29, "expl_partial": 0.14},
+    "find_bug_hard":   {"line": 0.30, "type": 0.30, "expl_full": 0.39, "expl_partial": 0.19},
 }
 
 # ---------------------------------------------------------------------------
@@ -206,16 +219,16 @@ class BugReviewEnvironment:
     Episodes allow up to MAX_ATTEMPTS actions per task.
     After each attempt, detailed feedback guides the agent.
     The episode ends when:
-      - Agent achieves perfect score (1.0)
+      - Agent achieves score >= 0.99 (near-perfect)
       - Agent exhausts all attempts
     Final reward = best score achieved across all attempts.
-    Repeated identical wrong answers incur a small penalty.
+    All scores are strictly between 0.01 and 0.99.
     """
 
     def __init__(self):
         self._state = BugReviewState()
         self._current_task: str = TASK_ORDER[0]
-        self._best_score: float = 0.0
+        self._best_score: float = 0.01
         self._attempts: int = 0
         self._max_attempts: int = MAX_ATTEMPTS
         self._last_action: dict = {}
@@ -227,7 +240,7 @@ class BugReviewEnvironment:
             task_name = TASK_ORDER[0]
 
         self._current_task = task_name
-        self._best_score = 0.0
+        self._best_score = 0.01
         self._attempts = 0
         self._max_attempts = TASKS[task_name]["max_attempts"]
         self._last_action = {}
@@ -238,7 +251,7 @@ class BugReviewEnvironment:
             step_count=0,
             task_name=task_name,
             attempts=0,
-            last_score=0.0,
+            last_score=0.01,
         )
 
         task = TASKS[task_name]
@@ -258,7 +271,8 @@ class BugReviewEnvironment:
           - Full credit for each correct component
           - Partial credit for partial explanation
           - Small penalty (-0.05) for repeating exact same wrong answer
-          - Episode ends when perfect score OR attempts exhausted
+          - Episode ends when near-perfect score OR attempts exhausted
+          - All rewards strictly between 0.01 and 0.99
         """
         self._state.step_count += 1
         self._attempts += 1
@@ -275,8 +289,8 @@ class BugReviewEnvironment:
             "buggy_line": action.buggy_line,
             "bug_type": action.bug_type,
         }
-        if self._last_action == current_action and score < 1.0:
-            score = max(0.0, score - 0.05)
+        if self._last_action == current_action and score < 0.99:
+            score = _clamp(score - 0.05)
             feedback += " | ⚠ Penalty: repeated same answer (-0.05)"
 
         self._last_action = current_action
@@ -288,9 +302,9 @@ class BugReviewEnvironment:
 
         self._state.last_score = score
 
-        # Determine if episode is done
+        # Determine if episode is done (0.99 = near-perfect threshold)
         attempts_left = self._max_attempts - self._attempts
-        perfect = score >= 1.0
+        perfect = score >= 0.99
         exhausted = attempts_left <= 0
         done = perfect or exhausted
 
@@ -298,7 +312,7 @@ class BugReviewEnvironment:
         if not done:
             feedback += f" | Attempts remaining: {attempts_left}"
         elif perfect:
-            feedback += " | 🎉 Perfect score! Well done."
+            feedback += " | 🎉 Excellent answer! Episode complete."
         else:
             feedback += f" | Episode complete. Best score: {self._best_score:.2f}"
 
@@ -310,8 +324,8 @@ class BugReviewEnvironment:
             done=done,
         )
 
-        # Return best score as final reward on last step
-        reward = self._best_score if done else score
+        # Always clamp the final reward too
+        reward = _clamp(self._best_score) if done else score
         return obs, reward, done
 
     @property
