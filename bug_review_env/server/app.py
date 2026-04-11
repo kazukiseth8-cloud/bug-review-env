@@ -97,12 +97,11 @@ def step(request: StepRequest):
         raise HTTPException(status_code=422, detail=f"Invalid action format: {e}")
 
     obs, reward, done = _env.step(action)
-
     return StepResult(
         observation=obs.model_dump(),
         reward=reward,
         done=done,
-        info={"score": reward, "task": _env.state.task_name},
+        info={"task": _env.state.task_name},
     ).model_dump()
 
 
