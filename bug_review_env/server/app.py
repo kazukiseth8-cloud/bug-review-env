@@ -18,6 +18,8 @@ from bug_review_env.models import BugReviewAction, BugReviewObservation, BugRevi
 def _clamp(score: float) -> float:
     """Ensure score is strictly inside (0, 1) — never exactly 0.0 or 1.0."""
     score = float(score)
+    if score != score:  # NaN check
+        return 0.5
     if score <= 0.0:
         return 0.01
     if score >= 1.0:
@@ -107,8 +109,9 @@ def step(request: StepRequest):
 
     obs, reward, done = _env.step(action)
 
-    # Final safety clamp — reward must be strictly between 0 and 1
-    reward = _clamp(reward)
+    # FIX: Clamp reward explicitly at the serialization boundary —
+    # this is the last line of defense before the value leaves the server.
+    reward = _clamp(float(reward))
 
     # Also clamp any floats inside the observation dict
     obs_dict = obs.model_dump()
