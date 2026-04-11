@@ -41,6 +41,9 @@ TEMPERATURE = 0.2
 MAX_TOKENS  = 400
 SUCCESS_SCORE_THRESHOLD = 0.5
 
+# Fallback reward — strictly between 0 and 1, never exactly 0.0 or 1.0
+FALLBACK_REWARD = 0.01
+
 TASKS = ["find_bug_easy", "find_bug_medium", "find_bug_hard"]
 
 # ---------------------------------------------------------------------------
@@ -52,8 +55,8 @@ def log_start(task: str, env: str, model: str) -> None:
 
 
 def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
-    error_val   = error if error else "null"
-    done_val    = str(done).lower()
+    error_val    = error if error else "null"
+    done_val     = str(done).lower()
     action_clean = action.replace(" ", "_").replace("\n", "").replace("\r", "")[:80]
     print(
         f"[STEP] step={step} action={action_clean} reward={reward:.2f} "
@@ -63,11 +66,19 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
 
 
 def log_end(success: bool, steps: int, rewards: List[float]) -> None:
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards) if rewards else "0.00"
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards) if rewards else f"{FALLBACK_REWARD:.2f}"
     print(
         f"[END] success={str(success).lower()} steps={steps} rewards={rewards_str}",
         flush=True,
     )
+
+# ---------------------------------------------------------------------------
+# Score clamping — all rewards must be strictly between 0 and 1
+# ---------------------------------------------------------------------------
+
+def _clamp(score: float) -> float:
+    """Ensure score is strictly inside (0, 1) — never exactly 0.0 or 1.0."""
+    return round(max(0.01, min(0.99, score)), 2)
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -209,7 +220,7 @@ async def run_task(client: OpenAI, task_name: str) -> None:
 
             # Step through environment
             result   = await env_step(action_dict)
-            reward   = float(result.get("reward", 0.0))
+            reward   = _clamp(float(result.get("reward", FALLBACK_REWARD)))
             done     = bool(result.get("done", True))
             obs      = result.get("observation", {})
             feedback = obs.get("feedback", "")
@@ -234,14 +245,14 @@ async def run_task(client: OpenAI, task_name: str) -> None:
             if done:
                 break
 
-        final_score = max(rewards) if rewards else 0.0
+        final_score = _clamp(max(rewards)) if rewards else FALLBACK_REWARD
         success     = final_score >= SUCCESS_SCORE_THRESHOLD
 
     except Exception as exc:
         error_msg = str(exc)[:100]
         print(f"[DEBUG] Task error in {task_name}: {exc}", flush=True)
         if not rewards:
-            rewards     = [0.0]
+            rewards     = [FALLBACK_REWARD]
             steps_taken = 1
         success = False
 
@@ -261,7 +272,7 @@ async def main() -> None:
         except Exception as exc:
             print(f"[DEBUG] Unhandled error in task {task}: {exc}", flush=True)
             log_start(task=task, env=BENCHMARK, model=MODEL_NAME)
-            log_end(success=False, steps=1, rewards=[0.0])
+            log_end(success=False, steps=1, rewards=[FALLBACK_REWARD])
 
 
 if __name__ == "__main__":
