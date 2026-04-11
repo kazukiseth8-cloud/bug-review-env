@@ -164,7 +164,9 @@ MAX_ATTEMPTS = 3
 # ---------------------------------------------------------------------------
 
 def _grade(action: BugReviewAction, answer: dict, weights: dict) -> Tuple[float, str, dict]:
-    score = 0.0
+    # FIX 1: Initialize score to 0.01 (never 0.0) so even a zero-component
+    # answer returns a safely clamped value before _clamp() is called.
+    score = 0.01
     parts = []
     components = {"line": False, "type": False, "explanation": False}
 
@@ -206,13 +208,19 @@ def _grade(action: BugReviewAction, answer: dict, weights: dict) -> Tuple[float,
     else:
         parts.append("✗ Explanation missing key concepts — think about the root cause (+0.00)")
 
-    # Clamp so intermediate scores are always safe
+    # Always clamp — guarantees (0.01, 0.99) regardless of weight arithmetic
     score = _clamp(score)
     feedback = " | ".join(parts) + f" → Score: {score:.2f}"
     return score, feedback, components
 
 
-# Key change: weights now sum to 0.99 max so perfect score = 0.99 (never 1.0)
+# Weights sum to at most 0.99 (never 1.0) so a perfect answer scores 0.99+0.01=1.00
+# but _clamp() catches that and returns 0.99.
+# Starting score is 0.01, so max raw = 0.01 + line + type + expl_full.
+# find_bug_easy:   0.01 + 0.40 + 0.30 + 0.29 = 1.00  → clamped to 0.99 ✓
+# find_bug_medium: 0.01 + 0.35 + 0.35 + 0.29 = 1.00  → clamped to 0.99 ✓
+# find_bug_hard:   0.01 + 0.30 + 0.30 + 0.39 = 1.00  → clamped to 0.99 ✓
+# Minimum raw = 0.01 → clamped to 0.01 ✓
 GRADER_WEIGHTS = {
     "find_bug_easy":   {"line": 0.40, "type": 0.30, "expl_full": 0.29, "expl_partial": 0.14},
     "find_bug_medium": {"line": 0.35, "type": 0.35, "expl_full": 0.29, "expl_partial": 0.14},
@@ -311,7 +319,8 @@ class BugReviewEnvironment:
         if score > self._best_score:
             self._best_score = score
 
-        self._state.last_score = score
+        # FIX 2: Clamp last_score at the point of assignment, not just at read-time
+        self._state.last_score = _clamp(score)
 
         # Determine if episode is done (0.99 = near-perfect threshold)
         attempts_left = self._max_attempts - self._attempts
@@ -335,8 +344,8 @@ class BugReviewEnvironment:
             done=done,
         )
 
-        # Always clamp the final reward too
-        reward = _clamp(self._best_score) if done else score
+        # FIX 3: Clamp both branches explicitly — never rely on upstream clamping alone
+        reward = _clamp(self._best_score) if done else _clamp(score)
         return obs, reward, done
 
     @property
