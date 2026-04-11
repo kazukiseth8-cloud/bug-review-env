@@ -1,6 +1,7 @@
 """
 FastAPI server for the Bug Review Environment.
 Exposes /reset, /step, /state endpoints per OpenEnv spec.
+All rewards strictly in (0, 1) — never 0.0, never 1.0.
 """
 import os
 import uuid
@@ -12,19 +13,22 @@ from bug_review_env.server.environment import BugReviewEnvironment, TASK_ORDER
 from bug_review_env.models import BugReviewAction, BugReviewObservation, BugReviewState
 
 # ---------------------------------------------------------------------------
-# Score clamping — all scores must be STRICTLY between 0 and 1
+# Score clamping — all scores STRICTLY between 0 and 1 (exclusive)
 # ---------------------------------------------------------------------------
 
 def _clamp(score: float) -> float:
     """Ensure score is strictly inside (0, 1) — never exactly 0.0 or 1.0."""
-    score = float(score)
-    if score != score:  # NaN check
-        return 0.5
-    if score <= 0.0:
-        return 0.01
-    if score >= 1.0:
-        return 0.99
-    return score
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return 0.05
+    if s != s:  # NaN check
+        return 0.05
+    if s <= 0.0:
+        return 0.05
+    if s >= 1.0:
+        return 0.95
+    return s
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -38,12 +42,11 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# One environment instance per server (stateless HTTP; each reset() starts fresh)
 _env = BugReviewEnvironment()
 _session_id: str = str(uuid.uuid4())
 
 # ---------------------------------------------------------------------------
-# Request / Response schemas (OpenEnv spec)
+# Request / Response schemas
 # ---------------------------------------------------------------------------
 class ResetRequest(BaseModel):
     task_name: Optional[str] = "find_bug_easy"
@@ -85,15 +88,17 @@ def health():
 def reset(request: ResetRequest = ResetRequest()):
     """
     Reset the environment and return the initial observation.
-    Optionally pass task_name: "find_bug_easy" | "find_bug_medium" | "find_bug_hard"
+    Always includes reward=0.05 and done=False.
     """
     task_name = request.task_name or "find_bug_easy"
     obs = _env.reset(task_name=task_name)
     result = obs.model_dump()
-    # Clamp any float fields in the observation
-    for key, val in result.items():
-        if isinstance(val, float):
-            result[key] = _clamp(val)
+
+    # CRITICAL: always include reward in reset response
+    # and ensure it is strictly inside (0, 1)
+    result["reward"] = 0.05
+    result["done"] = False
+
     return result
 
 @app.post("/step")
@@ -109,15 +114,10 @@ def step(request: StepRequest):
 
     obs, reward, done = _env.step(action)
 
-    # FIX: Clamp reward explicitly at the serialization boundary —
-    # this is the last line of defense before the value leaves the server.
+    # Clamp reward at serialization boundary — last line of defense
     reward = _clamp(float(reward))
 
-    # Also clamp any floats inside the observation dict
     obs_dict = obs.model_dump()
-    for key, val in obs_dict.items():
-        if isinstance(val, float):
-            obs_dict[key] = _clamp(val)
 
     return StepResult(
         observation=obs_dict,
