@@ -1,19 +1,17 @@
 """
 inference.py — Bug Review Environment Baseline Agent
 =====================================================
-Runs an LLM agent against all 3 bug review tasks and emits structured logs.
+Strictly follows Meta x Scaler OpenEnv Hackathon guidelines.
 
 Environment variables:
-    API_BASE_URL        LLM endpoint (default: HuggingFace router)
-    MODEL_NAME          Model to use  (default: Qwen/Qwen2.5-72B-Instruct)
-    HF_TOKEN            Your HuggingFace token (required)
-    LOCAL_IMAGE_NAME    Docker image name if using from_docker_image()
-    BUG_REVIEW_ENV_URL  URL of a live HF Space (used if set, else Docker)
+    API_BASE_URL   API endpoint for the LLM (default provided)
+    MODEL_NAME     Model identifier (default provided)
+    HF_TOKEN       Hugging Face API token (mandatory, no default)
 
-STDOUT FORMAT (mandatory — do not change):
+STDOUT FORMAT (mandatory):
     [START] task=<task_name> env=<benchmark> model=<model_name>
     [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
-    [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
+    [END]   success=<true|false> steps=<n> rewards=<r1,r2,...,rn>
 """
 
 import asyncio
@@ -29,22 +27,24 @@ from openai import OpenAI
 # Configuration — read from environment variables
 # ---------------------------------------------------------------------------
 
-API_BASE_URL  = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME    = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-API_KEY       = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "")
-IMAGE_NAME    = os.getenv("LOCAL_IMAGE_NAME", "bug-review-env:latest")
-ENV_URL       = os.getenv("BUG_REVIEW_ENV_URL", "")   # live HF Space URL if available
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+HF_TOKEN     = os.getenv("HF_TOKEN")
+ENV_URL      = os.getenv("BUG_REVIEW_ENV_URL", "http://localhost:7860")
 
-BENCHMARK     = "bug-review-env"
-MAX_STEPS     = 1          # Each task is single-step (one action per episode)
-TEMPERATURE   = 0.2        # Low temperature for deterministic reasoning
-MAX_TOKENS    = 400
-SUCCESS_SCORE_THRESHOLD = 0.5   # score >= 0.5 → success
+if HF_TOKEN is None:
+    raise ValueError("HF_TOKEN environment variable is required")
+
+BENCHMARK  = "bug-review-env"
+MAX_STEPS  = 1
+TEMPERATURE = 0.2
+MAX_TOKENS  = 400
+SUCCESS_SCORE_THRESHOLD = 0.5
 
 TASKS = ["find_bug_easy", "find_bug_medium", "find_bug_hard"]
 
 # ---------------------------------------------------------------------------
-# Logging helpers — MANDATORY FORMAT (do not modify field names or order)
+# Logging helpers — MANDATORY FORMAT (do not modify)
 # ---------------------------------------------------------------------------
 
 def log_start(task: str, env: str, model: str) -> None:
@@ -54,18 +54,18 @@ def log_start(task: str, env: str, model: str) -> None:
 def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
     error_val = error if error else "null"
     done_val  = str(done).lower()
+    action_clean = action.replace(" ", "_").replace("\n", "").replace("\r", "")[:80]
     print(
-        f"[STEP] step={step} action={action} reward={reward:.2f} "
+        f"[STEP] step={step} action={action_clean} reward={reward:.2f} "
         f"done={done_val} error={error_val}",
         flush=True,
     )
 
 
-def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+def log_end(success: bool, steps: int, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards) if rewards else "0.00"
     print(
-        f"[END] success={str(success).lower()} steps={steps} "
-        f"score={score:.3f} rewards={rewards_str}",
+        f"[END] success={str(success).lower()} steps={steps} rewards={rewards_str}",
         flush=True,
     )
 
@@ -93,31 +93,21 @@ SYSTEM_PROMPT = textwrap.dedent("""
 
 
 def build_user_prompt(code_snippet: str, instructions: str) -> str:
-    return textwrap.dedent(f"""
-        INSTRUCTIONS:
-        {instructions}
-
-        CODE SNIPPET (lines are numbered from 1):
-        ```python
-        {code_snippet}
-        ```
-
-        Respond with ONLY a JSON object with keys: buggy_line, bug_type, explanation.
-    """).strip()
-
+    return (
+        f"INSTRUCTIONS:\n{instructions}\n\n"
+        f"CODE SNIPPET (lines numbered from 1):\n"
+        f"```python\n{code_snippet}\n```\n\n"
+        f"Respond with ONLY a JSON object with keys: buggy_line, bug_type, explanation."
+    )
 
 # ---------------------------------------------------------------------------
-# LLM call
+# LLM call using OpenAI client (mandatory per guidelines)
 # ---------------------------------------------------------------------------
 
-def get_agent_action(
-    client: OpenAI,
-    code_snippet: str,
-    instructions: str,
-) -> dict:
-    """Call the LLM and parse the JSON action. Falls back to a default on failure."""
-    user_prompt = build_user_prompt(code_snippet, instructions)
+def get_agent_action(client: OpenAI, code_snippet: str, instructions: str) -> dict:
+    """Call the LLM and parse JSON action. Returns safe default on failure."""
     try:
+        user_prompt = build_user_prompt(code_snippet, instructions)
         completion = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
@@ -130,11 +120,21 @@ def get_agent_action(
         raw = (completion.choices[0].message.content or "").strip()
 
         # Strip markdown fences if present
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
+        if "```" in raw:
+            parts = raw.split("```")
+            for part in parts:
+                part = part.strip()
+                if part.startswith("json"):
+                    part = part[4:].strip()
+                try:
+                    parsed = json.loads(part)
+                    return {
+                        "buggy_line":  int(parsed.get("buggy_line", 0)),
+                        "bug_type":    str(parsed.get("bug_type", "other")),
+                        "explanation": str(parsed.get("explanation", "")),
+                    }
+                except Exception:
+                    continue
 
         parsed = json.loads(raw)
         return {
@@ -142,54 +142,77 @@ def get_agent_action(
             "bug_type":    str(parsed.get("bug_type", "other")),
             "explanation": str(parsed.get("explanation", "")),
         }
-    except Exception as exc:
-        print(f"[DEBUG] LLM parse error: {exc}", flush=True)
-        return {"buggy_line": 0, "bug_type": "other", "explanation": "parse error"}
 
+    except Exception as exc:
+        print(f"[DEBUG] LLM error: {exc}", flush=True)
+        return {"buggy_line": 0, "bug_type": "other", "explanation": "llm_error"}
+
+# ---------------------------------------------------------------------------
+# Environment calls using httpx (for env server communication only)
+# ---------------------------------------------------------------------------
+
+async def env_reset(task_name: str) -> dict:
+    import httpx
+    async with httpx.AsyncClient() as http:
+        resp = await http.post(
+            f"{ENV_URL}/reset",
+            json={"task_name": task_name},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def env_step(action: dict) -> dict:
+    import httpx
+    async with httpx.AsyncClient() as http:
+        resp = await http.post(
+            f"{ENV_URL}/step",
+            json={"action": action},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
 
 # ---------------------------------------------------------------------------
 # Run one task episode
 # ---------------------------------------------------------------------------
 
-async def run_task(env, task_name: str, client: OpenAI) -> None:
+async def run_task(client: OpenAI, task_name: str) -> None:
     """Run a single task episode and emit START / STEP / END logs."""
     rewards: List[float] = []
     steps_taken = 0
-    score = 0.0
-    success = False
+    success     = False
     error_msg: Optional[str] = None
 
     log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        # Reset
-        obs = await env.reset(task_name=task_name)
+        # Reset environment
+        obs_data     = await env_reset(task_name)
+        code_snippet = obs_data.get("code_snippet", "")
+        instructions = obs_data.get("instructions", "")
+        done         = obs_data.get("done", False)
 
         for step in range(1, MAX_STEPS + 1):
-            if obs.done:
+            if done:
                 break
 
-            # Get action from LLM
-            action_dict = get_agent_action(client, obs.code_snippet, obs.instructions)
-
-            # Import here to avoid circular import at module level
-            from bug_review_env import BugReviewAction
-            action = BugReviewAction(**action_dict)
+            # Get action from LLM using OpenAI client
+            action_dict = get_agent_action(client, code_snippet, instructions)
 
             # Step through environment
-            result = await env.step(action)
-            obs    = result.observation
-            reward = result.reward
-            done   = result.done
+            result = await env_step(action_dict)
+            reward = float(result.get("reward", 0.0))
+            done   = bool(result.get("done", True))
 
             rewards.append(reward)
             steps_taken = step
 
-            # Format action string for log (compact, single-line)
             action_str = (
-                f"line={action.buggy_line},"
-                f"type={action.bug_type},"
-                f"expl={action.explanation[:40].replace(' ', '_')}"
+                f"line={action_dict['buggy_line']},"
+                f"type={action_dict['bug_type']},"
+                f"expl={action_dict['explanation'][:30].replace(' ','_')}"
             )
 
             log_step(
@@ -207,42 +230,31 @@ async def run_task(env, task_name: str, client: OpenAI) -> None:
         success = score >= SUCCESS_SCORE_THRESHOLD
 
     except Exception as exc:
-        error_msg = str(exc)
-        print(f"[DEBUG] Episode error: {exc}", flush=True)
+        error_msg = str(exc)[:100]
+        print(f"[DEBUG] Task error in {task_name}: {exc}", flush=True)
         if not rewards:
-            rewards = [0.0]
+            rewards     = [0.0]
             steps_taken = 1
-        score   = 0.0
         success = False
 
     finally:
-        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
-
+        log_end(success=success, steps=steps_taken, rewards=rewards)
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    # Initialize OpenAI client (mandatory per guidelines)
+    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
-    # Connect to environment
-    if ENV_URL:
-        # Use live HF Space
-        from bug_review_env import BugReviewEnv
-        env = BugReviewEnv(base_url=ENV_URL)
-        async with env:
-            for task in TASKS:
-                await run_task(env, task, client)
-    else:
-        # Use local Docker image
-        from bug_review_env import BugReviewEnv
-        env = await BugReviewEnv.from_docker_image(IMAGE_NAME)
+    for task in TASKS:
         try:
-            for task in TASKS:
-                await run_task(env, task, client)
-        finally:
-            await env.close()
+            await run_task(client, task)
+        except Exception as exc:
+            print(f"[DEBUG] Unhandled error in task {task}: {exc}", flush=True)
+            log_start(task=task, env=BENCHMARK, model=MODEL_NAME)
+            log_end(success=False, steps=1, rewards=[0.0])
 
 
 if __name__ == "__main__":
