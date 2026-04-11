@@ -1,20 +1,6 @@
 """
-Bug Review Environment — core logic (multi-step version).
-
-Three tasks of increasing difficulty:
-  easy   → obvious off-by-one error
-  medium → SQL injection / hardcoded secret
-  hard   → race condition
-
-Multi-step episodes:
-  - Agent gets up to MAX_ATTEMPTS tries per task
-  - After each attempt, detailed feedback is returned
-  - Reward increases as agent gets closer to correct answer
-  - Final reward = best score achieved across all attempts
-  - Partial credit awarded per component (line, type, explanation)
-  - Penalty for repeated identical wrong answers
-
-All scores are strictly between 0 and 1 (never exactly 0.0 or 1.0).
+Bug Review Environment — core logic.
+Scores are STRICTLY between 0 and 1 (exclusive) — never 0.0, never 1.0.
 """
 
 import uuid
@@ -23,24 +9,22 @@ from typing import Dict, Tuple, List
 from bug_review_env.models import BugReviewAction, BugReviewObservation, BugReviewState
 
 # ---------------------------------------------------------------------------
-# Score clamping — scores must be STRICTLY between 0 and 1
+# Score clamping — strictly (0, 1) exclusive, never 0.0 or 1.0
 # ---------------------------------------------------------------------------
 
 def _clamp(score: float) -> float:
-    """Ensure score is strictly inside (0, 1) — never exactly 0.0 or 1.0."""
-    score = float(score)
-
-    # Handle invalid numeric values
-    if score != score:  # NaN check
-        return 0.5
-
-    if score <= 0.0:
-        return 0.01
-
-    if score >= 1.0:
-        return 0.99
-
-    return score
+    """Ensure score is strictly between 0 and 1, never equal to either."""
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return 0.05
+    if s != s:  # NaN check
+        return 0.05
+    if s <= 0.0:
+        return 0.05
+    if s >= 1.0:
+        return 0.95
+    return round(s, 4)
 
 # ---------------------------------------------------------------------------
 # Task definitions
@@ -65,8 +49,7 @@ def compute_average(numbers):
             "Identify the line number where the bug occurs, classify the bug type "
             "(off_by_one | null_dereference | sql_injection | hardcoded_secret | "
             "race_condition | logic_error | insecure_deserialization | other), "
-            "and explain how to fix it. You have up to 3 attempts — use the "
-            "feedback from each attempt to improve your answer."
+            "and explain how to fix it. You have up to 3 attempts."
         ),
         "answer": {
             "buggy_line": 3,
@@ -74,6 +57,7 @@ def compute_average(numbers):
             "key_terms": ["len(items) - 1", "len(items)-1", "-1", "index out", "off by one", "off-by-one"],
         },
         "max_attempts": 3,
+        "weights": {"line": 0.38, "type": 0.28, "expl_full": 0.28, "expl_partial": 0.14},
     },
 
     "find_bug_medium": {
@@ -96,10 +80,10 @@ def login(username, password):
     return False
 """,
         "instructions": (
-            "This code contains TWO security vulnerabilities. "
+            "This code contains security vulnerabilities. "
             "Identify the most critical one: its line number, bug type, and explanation. "
             "Bug types: sql_injection | hardcoded_secret | logic_error. "
-            "You have up to 3 attempts — use the feedback to refine your answer."
+            "You have up to 3 attempts."
         ),
         "answer": {
             "buggy_line": 6,
@@ -112,6 +96,7 @@ def login(username, password):
             ],
         },
         "max_attempts": 3,
+        "weights": {"line": 0.33, "type": 0.33, "expl_full": 0.28, "expl_partial": 0.14},
     },
 
     "find_bug_hard": {
@@ -123,8 +108,8 @@ balance = 1000
 
 def withdraw(amount):
     global balance
-    if balance >= amount:          # line 7  — check
-        balance -= amount          # line 8  — act
+    if balance >= amount:          # line 7
+        balance -= amount          # line 8
         return True
     return False
 
@@ -134,13 +119,13 @@ def run_concurrent_withdrawals():
         t.start()
     for t in threads:
         t.join()
-    print("Final balance:", balance)   # can go negative!
+    print("Final balance:", balance)
 """,
         "instructions": (
             "This multi-threaded banking code has a subtle concurrency bug. "
             "Identify the line number, classify as race_condition, and explain "
             "why two concurrent withdrawals of 600 can each succeed when balance "
-            "is only 1000. You have up to 3 attempts — use feedback to improve."
+            "is only 1000. You have up to 3 attempts."
         ),
         "answer": {
             "buggy_line": 7,
@@ -153,124 +138,90 @@ def run_concurrent_withdrawals():
             ],
         },
         "max_attempts": 3,
+        "weights": {"line": 0.28, "type": 0.28, "expl_full": 0.38, "expl_partial": 0.19},
     },
 }
 
 TASK_ORDER = ["find_bug_easy", "find_bug_medium", "find_bug_hard"]
-MAX_ATTEMPTS = 3
 
 # ---------------------------------------------------------------------------
-# Grader functions — return (score, feedback, component_scores)
+# Grader
 # ---------------------------------------------------------------------------
 
-def _grade(action: BugReviewAction, answer: dict, weights: dict) -> Tuple[float, str, dict]:
-    # FIX 1: Initialize score to 0.01 (never 0.0) so even a zero-component
-    # answer returns a safely clamped value before _clamp() is called.
-    score = 0.01
+def _grade(action: BugReviewAction, answer: dict, weights: dict) -> Tuple[float, str]:
+    """Grade an action. Returns score strictly in (0, 1)."""
+    raw_score = 0.0
     parts = []
-    components = {"line": False, "type": False, "explanation": False}
 
     # Line number
     correct_line = action.buggy_line == answer.get("buggy_line")
     if not correct_line and "alt_buggy_line" in answer:
         correct_line = action.buggy_line == answer["alt_buggy_line"]
     if correct_line:
-        score += weights["line"]
-        components["line"] = True
-        parts.append(f"✓ Correct line number (+{weights['line']:.2f})")
+        raw_score += weights["line"]
+        parts.append(f"✓ Correct line (+{weights['line']:.2f})")
     else:
         expected = answer.get("buggy_line")
-        hint = "Hint: look between lines 1-10." if expected <= 10 else "Hint: look carefully at the logic flow."
-        parts.append(f"✗ Wrong line. {hint} (+0.00)")
+        parts.append(f"✗ Wrong line (expected {expected}) (+0.00)")
 
     # Bug type
     correct_type = action.bug_type == answer.get("bug_type")
     if not correct_type and "alt_bug_type" in answer:
         correct_type = action.bug_type == answer["alt_bug_type"]
     if correct_type:
-        score += weights["type"]
-        components["type"] = True
+        raw_score += weights["type"]
         parts.append(f"✓ Correct bug type (+{weights['type']:.2f})")
     else:
-        valid_types = "off_by_one|null_dereference|sql_injection|hardcoded_secret|race_condition|logic_error|insecure_deserialization|other"
-        parts.append(f"✗ Wrong bug type '{action.bug_type}'. Consider: {valid_types} (+0.00)")
+        parts.append(f"✗ Wrong bug type '{action.bug_type}' (+0.00)")
 
-    # Explanation key terms
+    # Explanation
     expl_lower = action.explanation.lower()
     matching = [t for t in answer.get("key_terms", []) if t in expl_lower]
     if len(matching) >= 2:
-        score += weights["expl_full"]
-        components["explanation"] = True
-        parts.append(f"✓ Explanation demonstrates understanding (+{weights['expl_full']:.2f})")
+        raw_score += weights["expl_full"]
+        parts.append(f"✓ Good explanation (+{weights['expl_full']:.2f})")
     elif len(matching) == 1:
-        score += weights["expl_partial"]
-        parts.append(f"~ Explanation partially correct — be more specific (+{weights['expl_partial']:.2f})")
+        raw_score += weights["expl_partial"]
+        parts.append(f"~ Partial explanation (+{weights['expl_partial']:.2f})")
     else:
-        parts.append("✗ Explanation missing key concepts — think about the root cause (+0.00)")
+        parts.append("✗ Explanation needs improvement (+0.00)")
 
-    # Always clamp — guarantees (0.01, 0.99) regardless of weight arithmetic
-    score = _clamp(score)
-    feedback = " | ".join(parts) + f" → Score: {score:.2f}"
-    return score, feedback, components
-
-
-# Weights sum to at most 0.99 (never 1.0) so a perfect answer scores 0.99+0.01=1.00
-# but _clamp() catches that and returns 0.99.
-# Starting score is 0.01, so max raw = 0.01 + line + type + expl_full.
-# find_bug_easy:   0.01 + 0.40 + 0.30 + 0.29 = 1.00  → clamped to 0.99 ✓
-# find_bug_medium: 0.01 + 0.35 + 0.35 + 0.29 = 1.00  → clamped to 0.99 ✓
-# find_bug_hard:   0.01 + 0.30 + 0.30 + 0.39 = 1.00  → clamped to 0.99 ✓
-# Minimum raw = 0.01 → clamped to 0.01 ✓
-GRADER_WEIGHTS = {
-    "find_bug_easy":   {"line": 0.40, "type": 0.30, "expl_full": 0.29, "expl_partial": 0.14},
-    "find_bug_medium": {"line": 0.35, "type": 0.35, "expl_full": 0.29, "expl_partial": 0.14},
-    "find_bug_hard":   {"line": 0.30, "type": 0.30, "expl_full": 0.39, "expl_partial": 0.19},
-}
+    # ALWAYS clamp to strictly (0, 1)
+    score = _clamp(raw_score)
+    feedback = " | ".join(parts) + f" → Score: {score:.4f}"
+    return score, feedback
 
 # ---------------------------------------------------------------------------
 # Environment class
 # ---------------------------------------------------------------------------
 
 class BugReviewEnvironment:
-    """
-    Multi-step OpenEnv-compatible environment for code bug review.
-
-    Episodes allow up to MAX_ATTEMPTS actions per task.
-    After each attempt, detailed feedback guides the agent.
-    The episode ends when:
-      - Agent achieves score >= 0.99 (near-perfect)
-      - Agent exhausts all attempts
-    Final reward = best score achieved across all attempts.
-    All scores are strictly between 0.01 and 0.99.
-    """
+    """Multi-step OpenEnv environment. Scores always strictly in (0, 1)."""
 
     def __init__(self):
         self._state = BugReviewState()
         self._current_task: str = TASK_ORDER[0]
-        self._best_score: float = 0.01
+        self._best_score: float = 0.05
         self._attempts: int = 0
-        self._max_attempts: int = MAX_ATTEMPTS
+        self._max_attempts: int = 3
         self._last_action: dict = {}
-        self._all_rewards: List[float] = []
 
     def reset(self, task_name: str = "find_bug_easy") -> BugReviewObservation:
-        """Start a new episode for the given task."""
         if task_name not in TASKS:
             task_name = TASK_ORDER[0]
 
         self._current_task = task_name
-        self._best_score = 0.01
+        self._best_score = 0.05
         self._attempts = 0
         self._max_attempts = TASKS[task_name]["max_attempts"]
         self._last_action = {}
-        self._all_rewards = []
 
         self._state = BugReviewState(
             episode_id=str(uuid.uuid4()),
             step_count=0,
             task_name=task_name,
             attempts=0,
-            last_score=0.01,
+            last_score=_clamp(0.05),
         )
 
         task = TASKS[task_name]
@@ -283,58 +234,40 @@ class BugReviewEnvironment:
         )
 
     def step(self, action: BugReviewAction) -> Tuple[BugReviewObservation, float, bool]:
-        """
-        Execute one step: grade the action, return (observation, reward, done).
-
-        Reward shaping:
-          - Full credit for each correct component
-          - Partial credit for partial explanation
-          - Small penalty (-0.05) for repeating exact same wrong answer
-          - Episode ends when near-perfect score OR attempts exhausted
-          - All rewards strictly between 0.01 and 0.99
-        """
         self._state.step_count += 1
         self._attempts += 1
         self._state.attempts = self._attempts
 
         task = TASKS[self._current_task]
         answer = task["answer"]
-        weights = GRADER_WEIGHTS[self._current_task]
+        weights = task["weights"]
 
-        score, feedback, components = _grade(action, answer, weights)
+        score, feedback = _grade(action, answer, weights)
 
-        # Penalty for repeating identical wrong answer
-        current_action = {
-            "buggy_line": action.buggy_line,
-            "bug_type": action.bug_type,
-        }
-        if self._last_action == current_action and score < 0.99:
-            score = _clamp(score - 0.05)
-            feedback += " | ⚠ Penalty: repeated same answer (-0.05)"
-
+        # Penalty for repeating same wrong answer
+        current_action = {"buggy_line": action.buggy_line, "bug_type": action.bug_type}
+        if self._last_action == current_action and score < 0.90:
+            score = _clamp(score - 0.04)
+            feedback += " | ⚠ Penalty: repeated same answer"
         self._last_action = current_action
-        self._all_rewards.append(score)
 
-        # Update best score
         if score > self._best_score:
             self._best_score = score
 
-        # FIX 2: Clamp last_score at the point of assignment, not just at read-time
         self._state.last_score = _clamp(score)
 
-        # Determine if episode is done (0.99 = near-perfect threshold)
         attempts_left = self._max_attempts - self._attempts
-        perfect = score >= 0.99
-        exhausted = attempts_left <= 0
-        done = perfect or exhausted
+        done = (score >= 0.90) or (attempts_left <= 0)
 
-        # Build feedback message
         if not done:
             feedback += f" | Attempts remaining: {attempts_left}"
-        elif perfect:
-            feedback += " | 🎉 Excellent answer! Episode complete."
+        elif score >= 0.90:
+            feedback += " | 🎉 Excellent work!"
         else:
-            feedback += f" | Episode complete. Best score: {self._best_score:.2f}"
+            feedback += f" | Episode complete. Best score: {self._best_score:.4f}"
+
+        # Final reward is always best score, always clamped
+        reward = _clamp(self._best_score) if done else _clamp(score)
 
         obs = BugReviewObservation(
             code_snippet=task["code_snippet"],
@@ -343,15 +276,8 @@ class BugReviewEnvironment:
             feedback=feedback,
             done=done,
         )
-
-        # FIX 3: Clamp both branches explicitly — never rely on upstream clamping alone
-        reward = _clamp(self._best_score) if done else _clamp(score)
         return obs, reward, done
 
     @property
     def state(self) -> BugReviewState:
         return self._state
-
-    @property
-    def all_rewards(self) -> List[float]:
-        return self._all_rewards
