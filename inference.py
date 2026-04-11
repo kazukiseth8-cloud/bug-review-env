@@ -64,7 +64,7 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
     done_val    = str(done).lower()
     action_clean = action.replace(" ", "_").replace("\n", "").replace("\r", "")[:80]
     print(
-        f"[STEP] step={step} action={action_clean} reward={safe_reward:.2f} "
+        f"[STEP] step={step} action={action_clean} reward={safe_reward:.4f} "
         f"done={done_val} error={error_val}",
         flush=True,
     )
@@ -73,7 +73,7 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
 def log_end(success: bool, steps: int, rewards: List[float]) -> None:
     # Always clamp all rewards before logging
     safe_rewards = [_clamp(r) for r in rewards] if rewards else [0.05]
-    rewards_str  = ",".join(f"{r:.2f}" for r in safe_rewards)
+    rewards_str  = ",".join(f"{r:.4f}" for r in safe_rewards)
     print(
         f"[END] success={str(success).lower()} steps={steps} rewards={rewards_str}",
         flush=True,
